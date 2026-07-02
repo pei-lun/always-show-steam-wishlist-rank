@@ -1,12 +1,12 @@
 // ==UserScript==
-// @name         Always Show Your Steam Wishlist Rank
-// @name:zh-TW   永遠顯示你的 Steam 願望清單順序
+// @name         Always Show Steam Wishlist Rank
+// @name:zh-TW   永遠顯示 Steam 願望清單順序
 // @namespace    https://github.com/pei-lun/always-show-your-steam-wishlist-rank
 // @version      0.1.0
-// @description       Show your wishlist rank on every item in any sort order. Data from Steam's official IWishlistService API.
-// @description:zh-TW 在任何排序方式下，於 Steam 願望清單每個項目左上角顯示你的順序數字。資料來自 Steam 官方 IWishlistService API。
+// @description       Show wishlist rank on every item in any sort order. Data from Steam's official IWishlistService API.
+// @description:zh-TW 在任何排序方式下，於 Steam 願望清單每個項目左上角顯示順序數字。資料來自 Steam 官方 IWishlistService API。
 // @author       Pei-Lun Huang
-// @match        https://store.steampowered.com/wishlist/*
+// @match        https://store.steampowered.com/*
 // @license      MIT
 // @grant        none
 // @run-at       document-idle
@@ -21,7 +21,9 @@
   let fetching = false;
 
   // ---- 從官方 API 載入排名對照表 ----
-  // 已驗證：response.items[].priority 就等於「您的排序（Your Rank）」畫面上的排名數字。
+  // priority 是清單擁有者設定的原始排序值。注意它不保證是連續的 1..N：
+  // 移除過的項目會留下空號、從未排序的項目為 0（在看別人的「個人自訂排序」清單上尤其明顯）。
+  // 我們直接顯示這個原始值，0 則不顯示徽章。
   // 注意：一定要用 credentials:'omit'，帶 cookie 會被 CORS 擋（API 回傳 ACAO:*）。
   async function loadRanks() {
     if (rankMap || fetching) return rankMap;
@@ -56,15 +58,19 @@
     // /wishlist/profiles/7656... 直接從網址取
     const inUrl = location.pathname.match(/profiles\/(\d{17})/);
     if (inUrl) return inUrl[1];
-    // /wishlist/id/vanity 則從頁面內嵌設定取（Steam 會在 HTML 中放 "steamid":"..."）
+    // /wishlist/id/vanity：擁有者 steamid 在願望清單 React 元件的 SSR props 裡，是雙重
+    // JSON 編碼、引號被跳脫的 {\"steamid\":\"...\",\"sort\":...}。未跳脫的 "steamid":"..."
+    // 是「觀看者本人」的 session 資料，撈到它會在別人的清單上顯示自己的排名，故不使用。
+    // 鎖定緊接 \"sort\" 的那筆，確保是「正在檢視的這份清單」的擁有者。
     const inHtml = document.documentElement.outerHTML.match(
-      /"steamid"\s*:\s*"(\d{17})"/,
+      /\\"steamid\\":\\"(\d{17})\\",\\"sort\\"/,
     );
     return inHtml ? inHtml[1] : null;
   }
 
   // ---- 掃描目前可見的所有列 ----
   function applyAll() {
+    if (!rankMap) return; // 尚未載入（或不在願望清單頁）時，整段掃描直接略過
     document.querySelectorAll("div[data-index]").forEach((row) => {
       if (row.querySelector('a[href*="/app/"]')) addBadge(row);
     });
@@ -74,7 +80,8 @@
   function addBadge(row) {
     if (!rankMap) return;
 
-    // 「您的排序」模式下每列已有原生排名輸入框，直接略過（避免重複，且拖曳後不會顯示過期數字）
+    // 自己清單的「您的排序」（看別人清單則為「個人自訂排序」）模式下，每列已有原生排名
+    // 輸入框，直接略過（避免重複，且拖曳後不會顯示過期數字）
     if (row.querySelector('input[type="text"]')) {
       const old = row.querySelector(":scope > .wl-rank-badge");
       if (old) old.remove();
@@ -145,14 +152,50 @@
   // 捲動作為備援（有些虛擬化清單只改 transform 不動 DOM 結構）
   window.addEventListener("scroll", schedule, true);
 
-  // ---- 初始化：等清單渲染出來再載入排名 ----
-  (function init(tries) {
+  // ---- 判斷目前是否在願望清單頁 ----
+  // 用 \/+ 容忍開頭的重複斜線：下拉選單的連結是 //wishlist/（Steam 自己產錯的雙斜線），
+  // 整頁載入時伺服器會正規化，但 SPA 換頁不會，pathname 會維持 //wishlist/。
+  function onWishlist() {
+    return /^\/+wishlist(\/|$)/.test(location.pathname);
+  }
+
+  // ---- 等清單渲染出來再載入排名 ----
+  function initPoll(tries) {
+    if (!onWishlist()) return; // 途中已離開願望清單就停手
     if (document.querySelector('div[data-index] a[href*="/app/"]')) {
       loadRanks();
     } else if (tries < 60) {
-      setTimeout(() => init(tries + 1), 500);
+      setTimeout(() => initPoll(tries + 1), 500);
     } else {
       console.warn(LOG, "等待願望清單渲染逾時");
     }
-  })(0);
+  }
+
+  // ---- 啟動 / 重新啟動（含 SPA 換頁）----
+  // Steam 商店是單頁應用，從選單點進願望清單只是前端路由切換、不會整頁重載，
+  // Violentmonkey 不會在這種情況重新注入腳本。因此把 @match 放寬到整個 store，
+  // 讓腳本常駐分頁，再靠此處監聽網址變化，切到（或切換不同）願望清單時才啟動。
+  let lastPath = null;
+  function start() {
+    if (!onWishlist()) {
+      lastPath = null; // 離開願望清單：下次回來（即使同一份）要重新載入
+      return;
+    }
+    if (location.pathname === lastPath) return; // 同一份清單已處理，避免重複載入
+    lastPath = location.pathname;
+    rankMap = null; // 換到別份清單要重載擁有者的排名
+    fetching = false;
+    initPoll(0);
+  }
+
+  for (const type of ["pushState", "replaceState"]) {
+    const orig = history[type];
+    history[type] = function () {
+      const ret = orig.apply(this, arguments);
+      start();
+      return ret;
+    };
+  }
+  window.addEventListener("popstate", start);
+  start();
 })();
