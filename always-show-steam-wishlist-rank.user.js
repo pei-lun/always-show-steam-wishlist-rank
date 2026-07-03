@@ -21,6 +21,7 @@
   const LOG = "[WL-Rank]";
   let rankMap = null; // appid(string) -> rank(number)，rank 即 API 的 priority 欄位
   let fetching = false;
+  let loadSeq = 0; // 每次重新載入遞增；用來丟棄換清單前發出、之後才 resolve 的過時 fetch
 
   // ---- 從官方 API 載入排序對照表 ----
   // priority 是清單擁有者設定的原始排序值。注意它不保證是連續的 1..N：
@@ -30,6 +31,7 @@
   async function loadRanks() {
     if (rankMap || fetching) return rankMap;
     fetching = true;
+    const seq = loadSeq; // 記住這次載入的序號，供 resolve 後比對是否仍是當前清單
     try {
       const steamid = getSteamId();
       if (!steamid) {
@@ -44,13 +46,14 @@
       for (const it of items) {
         if (it.priority && it.priority > 0) map[String(it.appid)] = it.priority;
       }
+      if (seq !== loadSeq) return null; // 期間已換清單，丟棄這次結果以免蓋錯排序
       rankMap = map;
       console.log(LOG, `已載入 ${Object.keys(map).length} 筆排序`);
       applyAll();
     } catch (e) {
       console.error(LOG, "載入排序失敗", e);
     } finally {
-      fetching = false;
+      if (seq === loadSeq) fetching = false; // 過時 fetch 不得清掉當前載入的旗標
     }
     return rankMap;
   }
@@ -218,6 +221,7 @@
     lastPath = location.pathname;
     rankMap = null; // 換到別份清單要重載擁有者的排序
     fetching = false;
+    loadSeq++; // 作廢前一份清單仍 in-flight 的 fetch
     initPoll(0);
   }
 
